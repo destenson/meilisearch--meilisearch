@@ -29,7 +29,7 @@ use meilisearch_types::heed::{RoTxn, RwTxn};
 use meilisearch_types::milli::documents::{obkv_to_object, DocumentsBatchReader};
 use meilisearch_types::milli::heed::CompactionOption;
 use meilisearch_types::milli::update::new::indexer::{
-    self, retrieve_or_guess_primary_key, DocumentChanges,
+    self, retrieve_or_guess_primary_key, DocumentChanges, UpdateByFunction,
 };
 use meilisearch_types::milli::update::{
     IndexDocumentsConfig, IndexDocumentsMethod, IndexerConfig, Settings as MilliSettings,
@@ -1369,7 +1369,7 @@ impl IndexScheduler {
                 Ok(tasks)
             }
             IndexOperation::DocumentEdition { mut task, .. } => {
-                let (filter, context, function) =
+                let (filter, context, code) =
                     if let KindWithContent::DocumentEdition {
                         filter_expr, context, function, ..
                     } = &task.kind
@@ -1378,15 +1378,37 @@ impl IndexScheduler {
                     } else {
                         unreachable!()
                     };
-                let result_count = edit_documents_by_function(
-                    index_wtxn,
-                    filter,
-                    context.clone(),
-                    function,
-                    self.index_mapper.indexer_config(),
-                    self.must_stop_processing.clone(),
-                    index,
-                );
+
+                let candidates = match filter.as_ref().map(Filter::from_json) {
+                    Some(Ok(Some(filter))) => {
+                        filter.evaluate(wtxn, index).map_err(|err| match err {
+                            milli::Error::UserError(milli::UserError::InvalidFilter(_)) => {
+                                Error::from(err).with_custom_error_code(Code::InvalidDocumentFilter)
+                            }
+                            e => e.into(),
+                        })?
+                    }
+                    None | Some(Ok(None)) => index.documents_ids(wtxn)?,
+                    Some(Err(e)) => return Err(e.into()),
+                };
+
+                let rtxn = index.read_txn()?;
+                let mut fields_ids_map = index.fields_ids_map(&rtxn)?;
+
+                if !tasks.iter().all(|res| res.error.is_some()) {
+                    /// TODO create a pool if needed
+                    // let pool = indexer_config.thread_pool.unwrap();
+                    let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
+
+                    let param = (index, &rtxn);
+                    let mut indexer = UpdateByFunction::new(candidates, context, code.clone());
+                    let document_changes = indexer.document_changes(&mut fields_ids_map, param)?;
+                    /// TODO pass/write the FieldsIdsMap
+                    indexer::index(index_wtxn, index, fields_ids_map, &pool, document_changes)?;
+
+                    // tracing::info!(indexing_result = ?addition, processed_in = ?started_processing_at.elapsed(), "document indexing done");
+                }
+
                 let (original_filter, context, function) = if let Some(Details::DocumentEdition {
                     original_filter,
                     context,
