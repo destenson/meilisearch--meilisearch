@@ -1,16 +1,17 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use heed::RoTxn;
+use obkv::KvWriter;
 use rayon::iter::{IndexedParallelIterator, ParallelBridge, ParallelIterator};
 use rhai::{Dynamic, Engine, OptimizationLevel, Scope};
 use roaring::RoaringBitmap;
-use tracing::field;
 
 use super::DocumentChanges;
 use crate::error::{FieldIdMapMissingEntry, InternalError};
-use crate::update::new::{Deletion, DocumentChange, KvReaderFieldId, Update};
+use crate::update::new::{Deletion, DocumentChange, KvReaderFieldId, KvWriterFieldId, Update};
 use crate::{
-    all_obkv_to_json, Error, FieldsIdsMap, Index, InternalError, Object, Result, UserError,
+    all_obkv_to_json, Error, FieldsIdsMap, GlobalFieldsIdsMap, Index, Object, Result, UserError,
 };
 
 pub struct UpdateByFunction {
@@ -26,18 +27,18 @@ impl UpdateByFunction {
 }
 
 impl<'p> DocumentChanges<'p> for UpdateByFunction {
-    type Parameter = (&'p Index, &'p RoTxn<'p>, &'p FieldsIdsMap);
+    type Parameter = (&'p Index, &'p RoTxn<'p>);
 
     fn document_changes(
         self,
-        _fields_ids_map: &mut FieldsIdsMap,
+        fields_ids_map: &mut FieldsIdsMap,
         param: Self::Parameter,
     ) -> Result<
         impl IndexedParallelIterator<Item = std::result::Result<DocumentChange, Arc<Error>>>
             + Clone
             + 'p,
     > {
-        let (index, rtxn, fields_ids_map) = param;
+        let (index, rtxn) = param;
 
         // Setup the security and limits of the Engine
         let mut engine = Engine::new();
@@ -63,12 +64,13 @@ impl<'p> DocumentChanges<'p> for UpdateByFunction {
         Ok(self.documents.into_iter().par_bridge().map(move |docid| {
             // safety: Both documents *must* exists in the database as
             //         their IDs comes from the list of documents ids.
-            let current_document = index.document(rtxn, docid)?;
-            let rhai_document = obkv_to_rhaimap(current_document, fields_ids_map)?;
-            let json_document = all_obkv_to_json(current_document, fields_ids_map)?;
+            let document = index.document(rtxn, docid)?;
+            let rhai_document = obkv_to_rhaimap(document, fields_ids_map)?;
+            let json_document = all_obkv_to_json(document, fields_ids_map)?;
             let document_id = &json_document[primary_key];
 
             let mut scope = Scope::new();
+            let mut buffer = Vec::new();
             if let Some(context) = context.as_ref().cloned() {
                 scope.push_constant_dynamic("context", context.clone());
             }
@@ -85,26 +87,31 @@ impl<'p> DocumentChanges<'p> for UpdateByFunction {
                 Some(doc) if doc.is_unit() => Ok(DocumentChange::Deletion(Deletion::create(
                     docid,
                     document_id,
-                    current_document.boxed(),
+                    document.boxed(),
                 ))),
                 None => unreachable!("missing doc variable from the Rhai scope"),
                 Some(new_document) => match new_document.try_cast() {
-                    Some(new_document) => {
-                        let new_document = rhaimap_to_object(new_document);
+                    Some(new_rhai_document) => {
+                        let new_json_document = rhaimap_to_object(new_rhai_document);
                         // Note: This condition is not perfect. Sometimes it detect changes
                         //       like with floating points numbers and consider updating
                         //       the document even if nothing actually changed.
-                        if json_document != new_document {
-                            if Some(document_id) != new_document.get(primary_key) {
+                        if json_document != new_json_document {
+                            if Some(document_id) != new_json_document.get(primary_key) {
                                 Err(Error::UserError(
                                     UserError::DocumentEditionCannotModifyPrimaryKey,
                                 ))
                             } else {
-                                let new = todo!();
+                                let global_fields_ids_map = todo!();
+                                let new = rhaimap_to_obkv(
+                                    new_rhai_document,
+                                    global_fields_ids_map,
+                                    &mut buffer,
+                                )?;
                                 Ok(DocumentChange::Update(Update::create(
                                     docid,
                                     document_id,
-                                    current_document.boxed(),
+                                    document.boxed(),
                                     new,
                                 )))
                             }
@@ -113,8 +120,8 @@ impl<'p> DocumentChanges<'p> for UpdateByFunction {
                             Ok(DocumentChange::Update(Update::create(
                                 docid,
                                 document_id,
-                                current_document.boxed(),
-                                current_document.boxed(),
+                                document.boxed(),
+                                document.boxed(),
                             )))
                         }
                     }
@@ -151,4 +158,33 @@ fn rhaimap_to_object(map: rhai::Map) -> Object {
         output.insert(key.into(), value);
     }
     output
+}
+
+fn rhaimap_to_obkv(
+    map: rhai::Map,
+    global_fields_ids_map: &mut GlobalFieldsIdsMap,
+    buffer: &mut Vec<u8>,
+) -> Result<Box<KvReaderFieldId>> {
+    let result: Result<BTreeMap<_, _>> = map
+        .keys()
+        .map(|key| {
+            global_fields_ids_map
+                .id_or_insert(key)
+                .ok_or(UserError::AttributeLimitReached)
+                .map_err(Error::from)
+                .map(|fid| (fid, key))
+        })
+        .collect();
+
+    let ordered_fields = result?;
+    let mut writer = KvWriterFieldId::memory();
+    for (fid, key) in ordered_fields {
+        let value = map.get(key).unwrap();
+        let value = serde_json::to_value(value).unwrap();
+        buffer.clear();
+        serde_json::to_writer(&mut *buffer, &value).unwrap();
+        writer.insert(fid, &buffer)?;
+    }
+
+    Ok(writer.into_boxed())
 }
