@@ -25,6 +25,7 @@ use crate::facet::FacetType;
 use crate::proximity::ProximityPrecision;
 use crate::update::new::channel::ExtractorSender;
 use crate::update::new::parallel_iterator_ext::ParallelIteratorExt;
+use crate::update::new::words_prefix_docids::compute_exact_word_prefix_docids;
 use crate::update::settings::InnerIndexSettings;
 use crate::update::{FacetsUpdateBulk, GrenadParameters};
 use crate::{Error, FieldsIdsMap, GlobalFieldsIdsMap, Index, Result, UserError};
@@ -252,6 +253,8 @@ fn compute_prefix_database(
     let PrefixDelta { modified, deleted } = prefix_delta;
     // Compute word prefix docids
     compute_word_prefix_docids(wtxn, index, &modified, &deleted)?;
+    // Compute exact word prefix docids
+    compute_exact_word_prefix_docids(wtxn, index, &modified, &deleted)?;
     // Compute word prefix fid docids
     compute_word_prefix_fid_docids(wtxn, index, &modified, &deleted)?;
     // Compute word prefix position docids

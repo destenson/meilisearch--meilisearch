@@ -10,15 +10,13 @@ use std::collections::HashSet;
 
 use super::channel::*;
 use super::extract::FacetKind;
-use super::word_fst_builder::{PrefixData, PrefixDelta, PrefixSettings};
+use super::word_fst_builder::{PrefixData, PrefixDelta};
 use super::{Deletion, DocumentChange, Insertion, KvReaderDelAdd, KvReaderFieldId, Update};
 use crate::update::del_add::DelAdd;
 use crate::update::new::channel::MergerOperation;
 use crate::update::new::word_fst_builder::WordFstBuilder;
 use crate::update::MergeDeladdCboRoaringBitmaps;
-use crate::{
-    CboRoaringBitmapCodec, Error, FieldId, GeoPoint, GlobalFieldsIdsMap, Index, Prefix, Result,
-};
+use crate::{CboRoaringBitmapCodec, Error, FieldId, GeoPoint, GlobalFieldsIdsMap, Index, Result};
 
 /// TODO We must return some infos/stats
 #[tracing::instrument(level = "trace", skip_all, target = "indexing::documents", name = "merge")]
@@ -65,12 +63,7 @@ pub fn merge_grenad_entries(
             MergerOperation::WordDocidsMerger(merger) => {
                 let words_fst = index.words_fst(rtxn)?;
                 let mut word_fst_builder = WordFstBuilder::new(&words_fst)?;
-                /// TODO make this configurable
-                let prefix_settings = PrefixSettings {
-                    compute_prefixes: true,
-                    max_prefix_length: 4,
-                    prefix_count_threshold: 100,
-                };
+                let prefix_settings = index.prefix_settings(rtxn)?;
                 word_fst_builder.with_prefix_settings(prefix_settings);
 
                 {
