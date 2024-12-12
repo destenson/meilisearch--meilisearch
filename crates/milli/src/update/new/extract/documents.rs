@@ -63,6 +63,7 @@ impl<'a, 'b, 'extractor> Extractor<'extractor> for DocumentsExtractor<'a, 'b> {
                         &context.rtxn,
                         context.index,
                         &context.db_fields_ids_map,
+                        &context.doc_alloc,
                     )?;
                     let geo_iter =
                         content.geo_field().transpose().map(|res| res.map(|rv| ("_geo", rv)));
@@ -79,8 +80,12 @@ impl<'a, 'b, 'extractor> Extractor<'extractor> for DocumentsExtractor<'a, 'b> {
                 }
                 DocumentChange::Update(update) => {
                     let docid = update.docid();
-                    let content =
-                        update.current(&context.rtxn, context.index, &context.db_fields_ids_map)?;
+                    let content = update.current(
+                        &context.rtxn,
+                        context.index,
+                        &context.db_fields_ids_map,
+                        &context.doc_alloc,
+                    )?;
                     let geo_iter =
                         content.geo_field().transpose().map(|res| res.map(|rv| ("_geo", rv)));
                     for res in content.iter_top_level_fields().chain(geo_iter) {
@@ -103,8 +108,12 @@ impl<'a, 'b, 'extractor> Extractor<'extractor> for DocumentsExtractor<'a, 'b> {
                         *entry += 1;
                     }
 
-                    let content =
-                        update.merged(&context.rtxn, context.index, &context.db_fields_ids_map)?;
+                    let content = update.merged(
+                        &context.rtxn,
+                        context.index,
+                        &context.db_fields_ids_map,
+                        &context.doc_alloc,
+                    )?;
                     let vector_content = update.merged_vectors(
                         &context.rtxn,
                         context.index,

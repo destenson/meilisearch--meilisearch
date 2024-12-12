@@ -1,11 +1,15 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::{OnceLock, RwLock};
 use std::thread::{self, Builder};
 
 use big_s::S;
+use bumpalo::Bump;
 use bumparaw_collections::RawMap;
-use document_changes::{extract, DocumentChanges, IndexingContext};
+use document_changes::{
+    extract, DocumentChangeContext, DocumentChanges, Extractor, IndexingContext, Progress,
+};
 pub use document_deletion::DocumentDeletion;
 pub use document_operation::{DocumentOperation, PayloadStats};
 use hashbrown::HashMap;
@@ -17,18 +21,20 @@ use rand::SeedableRng as _;
 use rustc_hash::FxBuildHasher;
 use time::OffsetDateTime;
 pub use update_by_function::UpdateByFunction;
+use zstd::dict::{DecoderDictionary, EncoderDictionary};
 
 use super::channel::*;
+use super::document::Document as _;
 use super::extract::*;
 use super::facet_search_builder::FacetSearchBuilder;
 use super::merger::FacetFieldIdsDelta;
 use super::steps::IndexingStep;
-use super::thread_local::ThreadLocal;
+use super::thread_local::{FullySend, MostlySend, ThreadLocal};
 use super::word_fst_builder::{PrefixData, PrefixDelta, WordFstBuilder};
 use super::words_prefix_docids::{
     compute_word_prefix_docids, compute_word_prefix_fid_docids, compute_word_prefix_position_docids,
 };
-use super::StdResult;
+use super::{DocumentChange, StdResult};
 use crate::documents::{PrimaryKey, DEFAULT_PRIMARY_KEY};
 use crate::facet::FacetType;
 use crate::fields_ids_map::metadata::{FieldIdMapWithMetadata, MetadataBuilder};
@@ -38,6 +44,7 @@ use crate::proximity::ProximityPrecision;
 use crate::update::del_add::DelAdd;
 use crate::update::new::extract::EmbeddingExtractor;
 use crate::update::new::merger::merge_and_send_rtree;
+use crate::update::new::ref_cell_ext::RefCellExt as _;
 use crate::update::new::words_prefix_docids::compute_exact_word_prefix_docids;
 use crate::update::new::{merge_and_send_docids, merge_and_send_facet_docids, FacetDatabases};
 use crate::update::settings::InnerIndexSettings;
@@ -111,6 +118,9 @@ where
         .install(|| extractor_writer_bbqueue(&mut bbbuffers, total_bbbuffer_capacity, 1000))
         .unwrap();
 
+    let db_document_decompression_dictionary = index
+        .document_compression_raw_dictionary(wtxn)
+        .map(|opt| opt.map(DecoderDictionary::copy))?;
     let metadata_builder = MetadataBuilder::from_index(index, wtxn)?;
     let new_fields_ids_map = FieldIdMapWithMetadata::new(new_fields_ids_map, metadata_builder);
     let new_fields_ids_map = RwLock::new(new_fields_ids_map);
@@ -121,12 +131,26 @@ where
     let indexing_context = IndexingContext {
         index,
         db_fields_ids_map,
+        db_document_decompression_dictionary: db_document_decompression_dictionary.as_ref(),
         new_fields_ids_map: &new_fields_ids_map,
         doc_allocs: &doc_allocs,
         fields_ids_map_store: &fields_ids_map_store,
         must_stop_processing,
         progress,
     };
+
+    let document_compression_dictionary = pool
+        .install(|| {
+            let rtxn = index.read_txn()?;
+            compute_document_compression_dictionary(
+                index,
+                &rtxn,
+                document_changes,
+                indexing_context,
+                &mut extractor_allocs,
+            )
+        })
+        .unwrap()?;
 
     let mut index_embeddings = index.embedding_configs(wtxn)?;
     let mut field_distribution = index.field_distribution(wtxn)?;
@@ -429,7 +453,7 @@ where
 
             while let Some(action) = writer_receiver.recv_action() {
                 if _entered_post_merge.is_none()
-                    && finished_extraction.load(std::sync::atomic::Ordering::Relaxed)
+                    && finished_extraction.load(atomic::Ordering::Relaxed)
                 {
                     _entered_post_merge = Some(span.enter());
                 }
@@ -548,6 +572,141 @@ where
     index.set_updated_at(wtxn, &OffsetDateTime::now_utc())?;
 
     Ok(())
+}
+
+/// The compression level to use when compressing documents.
+const DOCUMENT_COMPRESSION_LEVEL: i32 = 19;
+/// The sample size used to generate the document compression dictionary.
+const DOCUMENT_COMPRESSION_SAMPLE_SIZE: usize = 10_000;
+/// The maximum size the document compression dictionary can be.
+const DOCUMENT_COMPRESSION_DICTIONARY_MAX_SIZE: usize = 64_000;
+/// The maximum number of documents we accept to compress if they
+/// weren't already compressed in the database. If this threshold
+/// is reached we do not generate a dictionary and continue as is.
+const DOCUMENT_COMPRESSION_COMPRESS_LIMIT: u64 = 5_000_000;
+
+/// A function dedicated to use the existing or generate an appropriate
+/// document compression dictionay based on the documents available in
+/// the database and the ones in the payload.
+///
+/// If there are too many documents already in the database and no
+/// compression dictionary we prefer not to generate a dictionary to avoid
+/// compressing all of the documents and potentially blow up disk space.
+fn compute_document_compression_dictionary<'pl, 'extractor, DC, MSP, SP>(
+    index: &Index,
+    rtxn: &RoTxn<'_>,
+    document_changes: &DC,
+    indexing_context: IndexingContext<MSP, SP>,
+    extractor_allocs: &'extractor mut ThreadLocal<FullySend<Bump>>,
+) -> Result<Option<EncoderDictionary<'static>>>
+where
+    DC: DocumentChanges<'pl>,
+    MSP: Fn() -> bool + Sync,
+    SP: Fn(Progress) + Sync,
+{
+    match index.document_compression_raw_dictionary(rtxn)? {
+        Some(dict) => Ok(Some(EncoderDictionary::copy(dict, DOCUMENT_COMPRESSION_LEVEL))),
+        None if index.number_of_documents(rtxn)? >= DOCUMENT_COMPRESSION_COMPRESS_LIMIT => Ok(None),
+        None => {
+            let datastore = ThreadLocal::with_capacity(rayon::current_num_threads());
+            let extractor = CompressorExtractor {
+                total_documents_to_extract: DOCUMENT_COMPRESSION_SAMPLE_SIZE,
+                extracted_documents_count: AtomicUsize::new(0),
+            };
+
+            todo!("collect the documents samples from the database first (or after)");
+
+            // This extraction only takes care about documents replacement
+            // and not update (merges). The merged documents are ignore as
+            // we will only use the previous version of them in the database.
+            extract(
+                document_changes,
+                &extractor,
+                indexing_context,
+                extractor_allocs,
+                &datastore,
+                Step::PreparingCompressionDictionary,
+            )?;
+
+            let mut sample_data = Vec::new();
+            let mut sample_sizes = Vec::new();
+            for data in datastore {
+                let CompressorExtractorData { buffer, must_stop: _ } = data.into_inner();
+                let mut subsample_size = 0;
+                for subsample in buffer {
+                    sample_data.extend_from_slice(subsample);
+                    subsample_size += subsample.len();
+                }
+                sample_sizes.push(subsample_size);
+            }
+
+            let dictionary = zstd::dict::from_continuous(
+                &sample_data,
+                &sample_sizes,
+                DOCUMENT_COMPRESSION_DICTIONARY_MAX_SIZE,
+            )?;
+
+            Ok(Some(EncoderDictionary::copy(&dictionary, DOCUMENT_COMPRESSION_LEVEL)))
+        }
+    }
+}
+
+struct CompressorExtractor {
+    total_documents_to_extract: usize,
+    extracted_documents_count: AtomicUsize,
+}
+
+#[derive(Default)]
+struct CompressorExtractorData<'extractor> {
+    buffer: Vec<&'extractor [u8]>,
+    /// We extracted the expected count of documents, we can skip everything now.
+    must_stop: bool,
+}
+
+unsafe impl<'extractor> MostlySend for RefCell<CompressorExtractorData<'extractor>> {}
+
+impl<'extractor> Extractor<'extractor> for CompressorExtractor {
+    type Data = RefCell<CompressorExtractorData<'extractor>>;
+
+    fn init_data<'doc>(
+        &'doc self,
+        _extractor_alloc: &'extractor bumpalo::Bump,
+    ) -> crate::Result<Self::Data> {
+        Ok(RefCell::new(CompressorExtractorData::default()))
+    }
+
+    fn process<'doc>(
+        &'doc self,
+        changes: impl Iterator<Item = crate::Result<DocumentChange<'doc>>>,
+        context: &'doc DocumentChangeContext<'_, 'extractor, '_, '_, Self::Data>,
+    ) -> crate::Result<()> {
+        let mut data = context.data.borrow_mut_or_yield();
+
+        for change in changes {
+            if data.must_stop {
+                return Ok(());
+            }
+
+            let change = change?;
+            match change {
+                DocumentChange::Deletion(_) => (),
+                DocumentChange::Update(_) => (),
+                DocumentChange::Insertion(insertion) => {
+                    for result in insertion.inserted().iter_top_level_fields() {
+                        let (_field_name, raw_value) = result?;
+                        let bytes = raw_value.get().as_bytes();
+                        data.buffer.push(context.extractor_alloc.alloc_slice_copy(bytes));
+                    }
+
+                    let previous_count =
+                        self.extracted_documents_count.fetch_add(1, atomic::Ordering::SeqCst);
+                    data.must_stop = previous_count >= self.total_documents_to_extract;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// A function dedicated to manage all the available BBQueue frames.
