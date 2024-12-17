@@ -5,7 +5,7 @@ use std::thread::{self, Builder};
 
 use big_s::S;
 use bumparaw_collections::RawMap;
-pub use document_changes::{extract, DocumentChanges, IndexingContext, Progress};
+pub use document_changes::{extract, DocumentChanges, IndexingContext};
 pub use document_deletion::DocumentDeletion;
 pub use document_operation::{DocumentOperation, PayloadStats};
 use hashbrown::HashMap;

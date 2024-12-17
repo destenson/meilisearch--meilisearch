@@ -10,11 +10,11 @@ use zstd::dict::{from_continuous, EncoderDictionary};
 use crate::heed_codec::CompressedObkvU16;
 use crate::update::new::document::Document as _;
 use crate::update::new::indexer::document_changes::{
-    DocumentChangeContext, DocumentChanges, Extractor, IndexingContext, Progress,
+    DocumentChangeContext, DocumentChanges, Extractor, IndexingContext,
 };
 use crate::update::new::indexer::extract;
 use crate::update::new::ref_cell_ext::RefCellExt as _;
-use crate::update::new::steps::Step;
+use crate::update::new::steps::IndexingStep;
 use crate::update::new::thread_local::{FullySend, MostlySend, ThreadLocal};
 use crate::update::new::DocumentChange;
 use crate::{Index, Result};
@@ -42,17 +42,16 @@ const COMPRESS_LIMIT: usize = 5_000_000;
 /// If there are too many documents already in the database and no
 /// compression dictionary we prefer not to generate a dictionary to avoid
 /// compressing all of the documents and potentially blow up disk space.
-pub fn retrieve_or_compute_document_compression_dictionary<'pl, 'extractor, DC, MSP, SP>(
+pub fn retrieve_or_compute_document_compression_dictionary<'pl, 'extractor, DC, MSP>(
     index: &Index,
     wtxn: &mut RwTxn<'_>,
     document_changes: &DC,
-    indexing_context: IndexingContext<MSP, SP>,
+    indexing_context: IndexingContext<MSP>,
     extractor_allocs: &'extractor mut ThreadLocal<FullySend<Bump>>,
 ) -> Result<Option<EncoderDictionary<'static>>>
 where
     DC: DocumentChanges<'pl>,
     MSP: Fn() -> bool + Sync,
-    SP: Fn(Progress) + Sync,
 {
     let number_of_documents = index.number_of_documents(wtxn)? as usize;
     match index.document_compression_raw_dictionary(wtxn)? {
@@ -87,7 +86,7 @@ where
                 indexing_context,
                 extractor_allocs,
                 &datastore,
-                Step::PreparingCompressionDictionary,
+                IndexingStep::PreparingCompressionDictionary,
             )?;
 
             let mut all_documents_seen = RoaringBitmap::new();
