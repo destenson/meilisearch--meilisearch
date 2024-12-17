@@ -891,10 +891,10 @@ impl IndexScheduler {
                     let (atomic, update_document_progress) = AtomicDocumentStep::new(nb_documents);
                     progress.update_progress(update_document_progress);
                     let documents = index
-                        .all_documents(&rtxn)
+                        .all_compressed_documents(&rtxn)
                         .map_err(|e| Error::from_milli(e, Some(uid.to_string())))?;
                     // 3.1. Dump the documents
-                    for ret in index.all_compressed_documents(&rtxn)? {
+                    for ret in documents {
                         if self.must_stop_processing.get() {
                             return Err(Error::AbortedTask);
                         }

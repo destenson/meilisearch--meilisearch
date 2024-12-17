@@ -3129,10 +3129,18 @@ mod tests {
         let rtxn = index.read_txn().unwrap();
         let field_ids_map = index.fields_ids_map(&rtxn).unwrap();
         let field_ids = field_ids_map.ids().collect::<Vec<_>>();
+        let dictionary = index.document_decompression_dictionary(&rtxn).unwrap();
+        let mut buffer = Vec::new();
         let documents = index
-            .all_documents(&rtxn)
+            .all_compressed_documents(&rtxn)
             .unwrap()
-            .map(|ret| obkv_to_json(&field_ids, &field_ids_map, ret.unwrap().1).unwrap())
+            .map(|ret| {
+                let (_docid, compressed_doc) = ret.unwrap();
+                let doc = compressed_doc
+                    .decompress_with_optional_dictionary(&mut buffer, dictionary.as_ref())
+                    .unwrap();
+                obkv_to_json(&field_ids, &field_ids_map, doc).unwrap()
+            })
             .collect::<Vec<_>>();
         snapshot!(serde_json::to_string_pretty(&documents).unwrap(), name: "documents_remaining_should_only_be_bork");
     }
