@@ -165,7 +165,7 @@ where
 
                 // document but we need to create a function that collects and compresses documents.
                 let document_sender = extractor_sender.documents();
-                let document_extractor = DocumentsExtractor::new(document_sender, embedders);
+                let document_extractor = DocumentsExtractor::new(document_sender, document_compression_dictionary.as_ref(), embedders);
                 let datastore = ThreadLocal::with_capacity(rayon::current_num_threads());
                 {
                     let span = tracing::trace_span!(target: "indexing::documents::extract", parent: &indexer_span, "documents");
